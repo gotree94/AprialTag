@@ -479,6 +479,10 @@ python generate_apriltags.py --all-families --grid
 - 격자 **클수록** → ID 수 증가, 오류 정정 강화
 - 마커 수가 5~10개 수준이면 `tag36h11`이 압도적으로 유리
 
+<img src="001.png">
+
+<img src="002.png">
+
 ---
 
 ### 8-2. 거리에 따른 마커 크기 조절
