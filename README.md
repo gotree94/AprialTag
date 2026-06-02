@@ -730,13 +730,125 @@ ros2 launch turtlebot3_navigation2 navigation2.launch.py \
 ### robot_localization EKF로 센서 융합
 
 ```bash
-# IMU + Wheel Odometry 융합 노드
+# IMU + Wheel Odometry 융합 노드 (기본형)
 ros2 run robot_localization ekf_node \
   --ros-args -p frequency:=30 \
   -p two_d_mode:=true \
   -p publish_tf:=true \
   -p odom0:=/odom \
   -p imu0:=/imu
+```
+
+---
+
+### EKF 파라미터 상세 해설
+
+#### `odom0:=/odom`, `imu0:=/imu` — 입력 센서 등록 방식
+
+`robot_localization` EKF 노드는 **여러 센서를 동시에 입력**받을 수 있도록 설계되었다.  
+각 입력은 인덱스 번호(0, 1, 2...)로 구분한다.
+
+```bash
+# 최대 2개의 odometry + 2개의 IMU까지 동시 입력 가능
+-p odom0:=/odom          # wheel encoder 기반 odometry
+-p odom1:=/visual_odom   # visual odometry (예: ORB-SLAM)
+-p imu0:=/imu            # IMU raw data
+-p imu1:=/imu_mag        # magnetometer 보정 IMU
+```
+
+각 센서의 **공분산(covariance)** 값을 보고 EKF가 최적 융합(가중 평균)을 자동 계산한다.  
+공분산이 작을수록(신뢰도 높음) 해당 센서에 더 큰 가중치가 할당된다.
+
+> **용어 구분**  
+> `odom0:=/odom` 은 "어떤 토픽을 입력으로 쓸지"만 알려주는 것.  
+> 아래 `odom0_config`로 "토픽의 15개 변수 중 실제로 융합에 쓸 변수"를 따로 지정해야 정상 동작한다.
+
+---
+
+#### `frequency:=30` — 추정 주파수
+
+EKF가 **위치 추정값을 계산하여 publish 하는 주파수(Hz)**.
+
+| 주파수 | 효과 | 문제점 |
+|---|---|---|
+| **10~30 Hz** (적정) | 실시간 제어에 충분 | — |
+| **50~100 Hz** | 더 부드러운 추정 | 센서 입력이 이 속도를 따라오지 못하면 불확실성만 증가 |
+| **100 Hz+** | 불필요 | CPU 과부하, 오히려 불안정 |
+
+TurtleBot3 기준 **30 Hz면 충분**.  
+센서가 더 빠르게 들어와도 EKF가 알아서 다운샘플링한다.
+
+---
+
+#### `odom0_config`, `imu0_config` — 각 센서의 사용 변수 지정 (필수)
+
+아래 파라미터를 빼먹으면 **센서를 등록만 해놓고 실제로는 안 쓰는** 상태가 된다.
+
+```bash
+# odom0 토픽의 15개 변수 중 사용할 변수 지정
+-p odom0_config:=[true,  true,  false,    # x, y, z (position) - z는 2D 모드라 false
+                  false, false, true,     # roll, pitch, yaw
+                  true,  true,  false,    # vx, vy, vz
+                  false, false, true]     # vroll, vpitch, vyaw
+
+# IMU 토픽 중 사용할 변수 지정
+-p imu0_config:=[false, false, false,     # x, y, z (position) - IMU는 위치를 주지 않음
+                 true,  true,  true,      # roll, pitch, yaw (IMU orientation)
+                 false, false, false,     # vx, vy, vz
+                 true,  true,  true]      # angular velocity (wx, wy, wz)
+```
+
+**변수 매핑 순서 (15개):**
+
+```
+[ x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az ]
+  0  1  2   3     4     5    6   7   8   9     10     11   12  13  14
+```
+
+→ `true` = EKF 융합에 사용, `false` = 무시
+
+---
+
+#### `two_d_mode:=true` — 2D 모드
+
+평지 주행 로봇(TurtleBot3)에 필수.  
+z축(높이), roll, pitch 변동을 무시하고 **x, y, yaw만 추정**하여 불필요한 drift를 막는다.
+
+---
+
+#### `publish_tf:=true` — TF 트리 발행
+
+EKF가 계산한 `odom → base_link` 변환을 TF 트리에 publish.  
+이 값이 `false`면 Rviz2에서 로봇 모델이 보이지 않고, 다른 노드들이 위치를 알 수 없다.
+
+---
+
+### 전체 권장 설정 (TurtleBot3 + Jetson Orin Nano)
+
+```bash
+ros2 run robot_localization ekf_node \
+  --ros-args \
+  -p frequency:=30 \
+  -p two_d_mode:=true \
+  -p publish_tf:=true \
+  \
+  -p odom0:=/odom \
+  -p odom0_config:=[true, true, false, \
+                    false, false, true, \
+                    true, false, false, \
+                    false, false, true, \
+                    false, false, false] \
+  -p odom0_differential:=false \
+  -p odom0_relative:=true \
+  \
+  -p imu0:=/imu \
+  -p imu0_config:=[false, false, false, \
+                   true, true, true, \
+                   false, false, false, \
+                   true, true, true, \
+                   false, false, false] \
+  -p imu0_differential:=false \
+  -p imu0_relative:=true
 ```
 
 | 구성 요소 | 역할 |
