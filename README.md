@@ -968,6 +968,165 @@ TurtleBot3의 `/odom` 토픽은 이 모델에 따라 **엔코더 틱 → 바퀴 
 
 ---
 
+## 센서 입력 주기 최적화 계산 시스템 (Sensor Timing Scheduler)
+
+### 개념
+
+전체 시스템의 **센서 입력 주기**와 **출력 한계**를 고려하여  
+최적의 데이터 수집·처리 주기를 계산하는 시스템.
+
+단순한 계산기가 아니라, 여러 계층의 제약 조건을 함께 풀어야 함.
+
+---
+
+### 입력 값 (Constraints)
+
+| 계층 | 요소 | 예시 |
+|---|---|---|
+| **센서 고유 주기** | IMU 200 Hz, LiDAR 10 Hz, 엔코더 50 Hz, 카메라 30 Hz | 센서 datasheet |
+| **통신 버스 대역폭** | I2C (400 kHz), UART (115200 bps), USB 2.0 (480 Mbps) | 버스 공유 시 충돌 |
+| **CPU 연산 한계** | Jetson Orin Nano: CPU 점유율 50% 한도, GPU 스케줄 | 실시간 태스크 보장 |
+| **출력 한계** | 모터 제어 주기 (DYNAMIXEL 100 Hz), PWM 해상도 | 액추에이터 응답 |
+| **제어 루프 요구사항** | EKF 예측 주기 ≥ IMU 주기, 제어 출력 주기 ≤ 모터 주기 | 안정성 조건 |
+
+---
+
+### 시스템 아키텍처
+
+```
+[입력]
+  - 센서 리스트 (type, max_rate, bus, latency)
+  - CPU 코어 수 / 가용률
+  - 출력 액추에이터 응답 시간
+       ↓
+[계산 엔진]
+  1. 버스 스케줄링 충돌 탐지
+  2. CPU 부하 예측 (센서 처리 비용 모델)
+  3. 제어 루프 안정성 조건 검사
+  4. 다중 레이트 EKF 조건 검증
+  5. 최적 주기 할당 (LP 또는 휴리스틱)
+       ↓
+[출력]
+  - 각 센서별 권장 sampling 주기
+  - EKF prediction/correction rate
+  - 제어 출력 주기
+  - 병목 경고 (어디가 한계인지)
+```
+
+---
+
+### 핵심 알고리즘 예시: 대역폭 / CPU 부하 계산
+
+```
+Input:
+  Sensor A: 200 Hz, 50 bytes/msg, USB (480 Mbps, 공유)
+  Sensor B:  50 Hz, 20 bytes/msg, UART (115200 bps)
+  Sensor C:  20 Hz, 2000 bytes/msg, USB (동일 버스)
+
+대역폭 계산:
+  Sensor A 대역폭 = 200 × 50 × 8 = 80,000 bps
+  Sensor C 대역폭 =  20 × 2000 × 8 = 320,000 bps
+  USB 합계 = 400,000 bps  ← USB 2.0 (480 Mbps) 대비 0.08% → 병목 아님
+
+  Sensor B UART = 50 × 20 × 8 = 8,000 bps
+     → UART 115,200 대비 6.9% → 여유 있음
+
+CPU 부하:
+  Sensor A 처리 = 200 Hz × 0.1 ms = 20 ms/s  → 코어 1개당 2%
+  Sensor B 처리 =  50 Hz × 0.5 ms = 25 ms/s  → 2.5%
+  Sensor C 처리 =  20 Hz × 2.0 ms = 40 ms/s  → 4%
+  EKF (30 Hz)   =  30 Hz × 1.0 ms = 30 ms/s  → 3%
+  제어 루프      = 100 Hz × 0.2 ms = 20 ms/s  → 2%
+     → 총 CPU ≈ 13.5% → 여유 있음
+
+→ EKF prediction rate를 IMU rate(200 Hz)로 올려도 CPU 20% 내외
+→ 제어 출력도 100 Hz 유지 가능
+```
+
+---
+
+### 다중 레이트 EKF 조건 검증
+
+EKF의 prediction step은 **가장 빠른 센서 주기**로 돌고,  
+correction step은 **각 센서가 들어올 때** 수행된다.
+
+시스템이 검증해야 할 조건:
+
+| 조건 | 수식 | 예시 |
+|---|---|---|
+| Prediction ≥ max 센서 속도 | `f_pred ≥ max(f_sensor)` | 200 Hz ≥ 200 Hz ✅ |
+| Nyquist 조건 (제어) | `f_control ≥ 2 × BW_system` | 100 Hz ≥ 2 × 10 Hz ✅ |
+| CPU 안전 마진 | `CPU_load < 70%` | 13.5% < 70% ✅ |
+| 출력 주기 ≤ 액추에이터 응답 | `T_control ≥ T_actuator_min` | 10 ms ≥ 10 ms ✅ |
+
+---
+
+### 구현 난이도
+
+| 수준 | 설명 | 난이도 |
+|---|---|---|
+| **Level 1** | 정적 YAML 설정 기반 — 센서 명세 입력 → 대역폭/CPU 계산 | 쉬움 (2~3일) |
+| **Level 2** | ROS2 토픽 통계(/stats) 수집 → 동적 부하 측정 → 권장 주기 도출 | 보통 (1~2주) |
+| **Level 3** | 실시간 CPU·버스 모니터링 → Adaptive scheduling | 어려움 (1~2개월) |
+| **Level 4** | 제어 안정성 이론 (Lyapunov, LQR) 결합 최적화 | 연구 수준 |
+
+TurtleBot3 + Jetson Orin Nano 수준에서는 **Level 1~2**면 실용적.
+
+---
+
+### 기존 ROS2 도구와의 차이
+
+| 도구 | 기능 | 한계 |
+|---|---|---|
+| `ros2 topic hz` | 토픽 발행 주기 측정 | 단일 토픽만, 전체 시스템 관점 없음 |
+| `ros2 topic bw` | 토픽 대역폭 측정 | 단일 토픽만 |
+| `ros2 bag` | 데이터 기록 | 분석 기능 없음 |
+| **Sensor Timing Scheduler** (제안) | 전체 센서/CPU/출력 통합 분석 | 아직 표준 도구 없음 |
+
+전체 시스템 관점에서 제약 조건을 종합해 최적 주기를 계산하는 도구는  
+아직 ROS2 생태계에 표준화되지 않았으므로 직접 개발 가치가 충분함.
+
+---
+
+### 예시 설정 파일 (YAML)
+
+```yaml
+sensors:
+  imu:
+    topic: /imu
+    type: BMI270
+    max_rate_hz: 200
+    msg_size_bytes: 48
+    bus: USB
+    processing_cost_ms: 0.1
+  lidar:
+    topic: /scan
+    type: LDS-02
+    max_rate_hz: 10
+    msg_size_bytes: 1200
+    bus: USB
+    processing_cost_ms: 2.0
+  wheel_encoder:
+    topic: /odom
+    max_rate_hz: 50
+    msg_size_bytes: 280
+    bus: UART
+    baud_rate: 115200
+    processing_cost_ms: 0.5
+
+controller:
+  type: diff_drive
+  actuator_max_hz: 100
+  cmd_topic: /cmd_vel
+
+system:
+  cpu_cores: 6
+  cpu_available_percent: 70
+  ekf_rate_hz: 30
+```
+
+---
+
 ## 참고
 
 - TurtleBot3 ROS2 공식 문서: [ROBOTIS e-Manual](https://emanual.robotis.com/docs/en/platform/turtlebot3/quick-start/)
