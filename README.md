@@ -538,9 +538,7 @@ python generate_apriltags.py --all-families --grid
 > 가려지는 순간 자체를 **로봇이 해당 위치를 통과했다는 트리거 신호**로 활용 가능.
 
 
-
 ---
-
 
 ## 참고 자료
 
@@ -549,6 +547,224 @@ python generate_apriltags.py --all-families --grid
 - [AprilTag 공식 사이트](https://april.eecs.umich.edu/software/apriltag)
 - [Isaac Sim Korea Cafe](https://cafe.naver.com/isaacsimkr)
 - [ROS2 TurtleBot3 URDF Import](https://nvidia-isaac-ros.github.io/)
+
+---
+
+# ROS2 TurtleBot3 1m 이동 명령 방법
+
+**환경**: ROS2 + Jetson Orin Nano + TurtleBot3 (IMU·LiDAR·엔코더 장착)
+
+---
+
+## 개요
+
+TurtleBot3에 "정확히 1m 직진"을 명령하는 방법은 크게 3가지.  
+정밀도와 구현 복잡도에 따라 선택한다.
+
+---
+
+## ① 오픈루프 속도 명령 (Open-Loop Velocity Command)
+
+**원리**: `/cmd_vel`에 일정 속도를 publish 하고, 계산된 시간 후 stop.
+
+```bash
+# 0.2 m/s로 5초간 publish → 1m 이동
+ros2 topic pub --rate 10 /cmd_vel geometry_msgs/Twist \
+  "{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" &
+sleep 5
+ros2 topic pub --once /cmd_vel geometry_msgs/Twist \
+  "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
+```
+
+| 항목 | 내용 |
+|---|---|
+| 메시지 타입 | `geometry_msgs/Twist` |
+| 토픽 | `/cmd_vel` |
+| 정밀도 | 낮음 (바퀴 슬립·배터리·지면 영향) |
+| 장점 | 가장 단순, 별도 패키지 불필요 |
+| 단점 | 실제 거리 부정확, 외란 보상 불가 |
+
+---
+
+## ② Odometry 피드백 기반 폐루프 제어 (Closed-Loop Odometry) ✅ **추천**
+
+**원리**: `/odom` (`nav_msgs/Odometry`)을 실시간 구독하여 이동 거리를 추적하고,  
+목표(1m) 도달 시 정지.
+
+### Python 노드 예시
+
+```python
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+class Move1m(Node):
+    def __init__(self):
+        super().__init__('move_1m')
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
+        self.start_x = None
+        self.target_distance = 1.0
+        self.moving = True
+
+    def odom_cb(self, msg):
+        if self.start_x is None:
+            self.start_x = msg.pose.pose.position.x
+            self.get_logger().info(f'Start position: {self.start_x}')
+
+        current_x = msg.pose.pose.position.x
+        distance = abs(current_x - self.start_x)
+        self.get_logger().info(f'Moved: {distance:.3f}m / {self.target_distance}m')
+
+        if distance >= self.target_distance:
+            twist = Twist()          # zero Twist = stop
+            self.cmd_pub.publish(twist)
+            self.moving = False
+            self.get_logger().info('Reached 1m!')
+            rclpy.shutdown()
+        elif self.moving:
+            twist = Twist()
+            twist.linear.x = 0.22   # TurtleBot3 Burger max: 0.22 m/s
+            self.cmd_pub.publish(twist)
+
+def main():
+    rclpy.init()
+    node = Move1m()
+    rclpy.spin(node)
+
+if __name__ == '__main__':
+    main()
+```
+
+### 실행 방법
+
+```bash
+# TurtleBot3 bringup (실제 로봇)
+ros2 launch turtlebot3_bringup robot.launch.py
+
+# 또는 Gazebo 시뮬레이션
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_gazebo empty_world.launch.py
+
+# 이동 노드 실행
+ros2 run your_package move_1m
+```
+
+| 항목 | 내용 |
+|---|---|
+| 사용 토픽 | publish: `/cmd_vel`, subscribe: `/odom` |
+| 정밀도 | 중간 (엔코더 기반, 슬립 시 오차 발생) |
+| 장점 | 외란에 강건, 구현 간단 |
+| 단점 | 바퀴 슬립 누적 시 오차 |
+
+---
+
+## ③ Nav2 액션 기반 목표 전송 (Nav2 Action Goal)
+
+**원리**: Nav2 스택의 `navigate_to_pose` 액션 서버에 목표 좌표를 전송.  
+지도 기반 localization + 장애물 회피 포함.
+
+### CLI로 직접 전송
+
+```bash
+# 프로토타입 확인
+ros2 interface proto nav2_msgs/action/NavigateToPose
+
+# 1m 앞(map坐标系 기준 (0,0) → (1,0))
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: 'map'}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}}" -f
+```
+
+### Python 액션 클라이언트
+
+```python
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+
+class Nav2GoalClient(Node):
+    def __init__(self):
+        super().__init__('nav2_goal_client')
+        self.client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+
+    def send_goal(self, x, y, yaw=0.0):
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.orientation.w = 1.0
+        # yaw → quaternion 변환은 tf_transformations 사용 권장
+
+        self.client.wait_for_server()
+        future = self.client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, future)
+        return future.result()
+```
+
+### Nav2 실행
+
+```bash
+# 지도 기반 Nav2 실행
+ros2 launch turtlebot3_navigation2 navigation2.launch.py \
+  map:=/path/to/map.yaml use_sim_time:=False
+
+# Rviz2에서 초기 위치 설정 후 액션 전송
+```
+
+| 항목 | 내용 |
+|---|---|
+| 액션 | `nav2_msgs/action/NavigateToPose` |
+| 정밀도 | 높음 (지도·LiDAR·IMU 융합) |
+| 장점 | 장애물 회피, recovery 행동 자동 |
+| 단점 | 지도 필요, Nav2 설정 복잡 |
+
+---
+
+## Jetson Orin Nano + IMU 활용 팁
+
+### robot_localization EKF로 센서 융합
+
+```bash
+# IMU + Wheel Odometry 융합 노드
+ros2 run robot_localization ekf_node \
+  --ros-args -p frequency:=30 \
+  -p two_d_mode:=true \
+  -p publish_tf:=true \
+  -p odom0:=/odom \
+  -p imu0:=/imu
+```
+
+| 구성 요소 | 역할 |
+|---|---|
+| **Jetson Orin Nano** | ROS2 노드 실행, EKF·센서 퓨전, GPU 가속 가능 |
+| **IMU** | robot_localization EKF로 odometry 개선 → 슬립·요철 보상 |
+| **LiDAR** | Nav2 localization (AMCL), 장애물 회피 |
+| **Wheel Encoder** | 기초 odometry 제공 (저주파 drift 존재) |
+
+---
+
+## 접근법 비교 요약
+
+| 방법 | 정밀도 | 구현 난이도 | 외란 강건 | 장애물 회피 | 추천 상황 |
+|---|---|---|---|---|---|
+| ① 오픈루프 `cmd_vel` | 낮음 (20~50% 오차) | ⭐ | ❌ | ❌ | 즉각 테스트 |
+| ② Odometry 폐루프 | 중간 (1~5% 오차) | ⭐⭐ | ✅ | ❌ | **일반적 정밀 이동** |
+| ② + IMU EKF 융합 | 높음 (<1% 오차) | ⭐⭐⭐ | ✅✅ | ❌ | 정밀 이동 필요 시 |
+| ③ Nav2 액션 골 | 높음 | ⭐⭐⭐⭐ | ✅✅ | ✅ | 자율주행·내비게이션 |
+
+---
+
+## 참고
+
+- TurtleBot3 ROS2 공식 문서: [ROBOTIS e-Manual](https://emanual.robotis.com/docs/en/platform/turtlebot3/quick-start/)
+- Nav2 공식 문서: [docs.nav2.org](https://docs.nav2.org/)
+- robot_localization: [ros2/robot_localization](https://github.com/cra-ros-pkg/robot_localization)
+
 
 ---
 
